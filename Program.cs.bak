@@ -1,0 +1,334 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.IO;
+using System.Threading.Tasks;
+using System.Net.Http;
+using System.Data;
+using System.Data.OleDb;
+using System.Security.Cryptography;
+using System.Text.Json;
+using System.Threading;
+using System.Reflection;
+using RestSharp;
+using System.Diagnostics;
+using static System.Net.Mime.MediaTypeNames;
+using System.Web.UI.WebControls;
+
+namespace FingerScan
+{
+    public class PostData
+    {
+        public string USERID { get; set; }
+        public string USERNAME { get; set; }
+        public string CHECKTIME { get; set; }
+    }
+    public class Absensi
+    {
+        public PostData CheckInOut { get; set; }
+    }
+
+    internal class Program
+    {
+        static string connStringHistory = "";
+        static string connStringAbsensi = "";
+        static string baseURL = "";
+        static int maxRecords = 0;
+        static int pauseEveryNSecs = 0;
+        static string machineId = "X";
+        static string logInfo = "";
+        static string completeLogText = "";
+        static volatile bool exit = false;
+
+        static void Main(string[] args)
+        {
+            readConfigFile();
+
+            logInfo = "Started at " + DateTime.Now;
+            PrintNLog(logInfo);
+
+            while (!exit)
+            {
+                cekAbsensi();
+
+                logInfo = $"Paused...";
+                PrintNLog(logInfo);
+                Thread.Sleep(pauseEveryNSecs * 1000);
+            }
+
+            //cekAbsensi();
+            //logInfo = "Stopped at " + DateTime.Now;
+            //PrintNLog(logInfo);
+            //SaveLogFile();
+
+            Console.ReadLine();
+        }
+
+        static void readConfigFile()
+        {
+            StreamReader sr = new StreamReader("FingerScan.ini");
+            string line = sr.ReadLine();
+
+            while (line != null)
+            {
+                string kar = line.Substring(0, 1);
+                if ("#'".Contains(kar) == false)
+                {
+                    var split = line.Split('=');
+                    string keyName = split[0].Trim();
+                    string value = split[1].Trim();
+
+                    switch (keyName.ToLower())
+                    {
+                        case "historydatabase":
+                            connStringHistory = @"provider=Microsoft.Jet.OLEDB.4.0; Data Source=" + value;
+                            break;
+                        case "absensidatabase":
+                            connStringAbsensi = @"provider=Microsoft.Jet.OLEDB.4.0; Data Source=" + value;
+                            break;
+                        case "machineid":
+                            machineId = value.ToString();
+                            break;
+                        case "odoourl":
+                            baseURL = value.ToString().Replace(@"\", "/");
+                            break;
+                        case "maxrecords":
+                            maxRecords = Convert.ToInt16(value);
+                            break;
+                        case "pauseevery":
+                            pauseEveryNSecs = Convert.ToInt16(value);
+                            break;
+                        default: break;
+                    }
+
+                    //logInfo = keyName + ": '" + value + "'";
+                    //PrintNLog(logInfo);
+                }
+
+                line = sr.ReadLine();   //read the next line
+            }
+            sr.Close();
+        }
+
+        static void cekAbsensi()
+        {
+            string tglMulai = "";
+            string sql = "";
+
+            try
+            {
+                using (OleDbConnection connHistory = new OleDbConnection(connStringHistory))
+                {
+                    connHistory.Open();
+                    sql = String.Format($"SELECT format(checktime,'yyyy-mm-dd HH:mm:ss') as checktime FROM LASTPROCESSED where machineid = '{machineId}'; ");
+                    using (OleDbCommand cmdLP = new OleDbCommand(sql, connHistory))
+                    {
+                        OleDbDataReader rdrLP = cmdLP.ExecuteReader();
+                        if (rdrLP.Read())
+                        {
+                            tglMulai = rdrLP.GetString(0);
+                        }
+                    }
+                }
+
+                if (maxRecords == 0)
+                    sql = "SELECT chk.userid, format(chk.checktime,'yyyy-mm-dd HH:mm:ss') as checktime, chk.checktype, u.name from " +
+                        "checkinout chk inner join userinfo u on chk.userid = u.userid ";
+                else
+                    sql = $"SELECT TOP {maxRecords} chk.userid, format(chk.checktime,'yyyy-mm-dd HH:mm:ss') as checktime, chk.checktype, u.name " +
+                        "from checkinout chk inner join userinfo u on chk.userid = u.userid ";
+
+                if (tglMulai != "")
+                {
+                    //sql = sql + $"WHERE format(chk.checktime, 'yyyy-mm-dd HH:mm:ss') >= '{tglMulai}' ";
+                    sql = sql + $"WHERE format(chk.checktime, 'yyyy-mm-dd HH:mm:ss') >= '{tglMulai}' and SenttoOdoo <> 'SUCCESS' ";
+                }
+                sql = sql + "ORDER BY chk.checktime;";
+
+                OleDbConnection connAbsensi = new OleDbConnection(connStringAbsensi);
+                connAbsensi.Open();
+                OleDbCommand cmdCheckIn = new OleDbCommand(sql, connAbsensi);
+                OleDbDataReader rdr = cmdCheckIn.ExecuteReader();
+                while (rdr.Read())
+                {
+                    string userId = rdr.GetInt32(0).ToString();
+                    string checkTime = rdr.GetValue(1).ToString();
+                    string checkType = rdr.GetString(2);
+                    string userName = rdr.GetString(3);
+
+                    using (OleDbConnection connHistory = new OleDbConnection(connStringHistory))
+                    {
+                        connHistory.Open();
+                        sql = String.Format($"SELECT userid FROM DATASENT where machineid = '{machineId}' and checktype = '{checkType}' " +
+                            $" and format(checktime,'yyyy-mm-dd HH:mm:ss') = '{checkTime}'; ");
+                        using (OleDbCommand cmdDS = new OleDbCommand(sql, connHistory))
+                        {
+                            OleDbDataReader rdrDS = cmdDS.ExecuteReader();
+                            if (rdrDS.Read())
+                            {
+                                if (connHistory.State == ConnectionState.Closed)
+                                    connHistory.Open();
+
+                                sql = $"SELECT * FROM LASTPROCESSED WHERE MACHINEID = '{machineId}';";
+                                OleDbCommand cmd = new OleDbCommand(sql, connHistory);
+                                OleDbDataReader rdrLP = cmd.ExecuteReader();
+                                if (rdrLP.Read())
+                                    sql = $"UPDATE LASTPROCESSED SET userid = '{userId}', checktime = '{checkTime}', checktype = '{checkType}' " +
+                                        $"WHERE machineid = '{machineId}'; ";
+                                else
+                                    sql = $"INSERT INTO LASTPROCESSED (userid, checktime, checktype, machineid) values " +
+                                        $"('{userId}', '{checkTime}', '{checkType}', '{machineId}')";
+                                rdrLP.Close();
+                                cmd.CommandText = sql;
+                                cmd.ExecuteNonQuery();
+
+
+                                sql = $"UPDATE CHECKINOUT SET SenttoOdoo = 'SUCCESS' WHERE userid = '{userId}' and checktime = '{checkTime}' and " +
+                                    $"checktype = '{checkType}'; ";
+                                OleDbCommand cmdSent = new OleDbCommand(sql, connAbsensi);
+                                cmdSent.CommandText = sql;
+                                cmdSent.ExecuteNonQuery();
+
+                                logInfo = $"Skipping USERID: {userId}, CHECKTIME: {checkTime}, NAME: {userName}...";
+                                PrintNLog(logInfo);
+
+                                continue;
+                            }
+                        }
+                    }
+
+                    var dataHarian = new PostData
+                    {
+                        USERID = userId,
+                        CHECKTIME = checkTime,
+                        USERNAME = userName
+                    };
+
+
+                    //var options = new RestClientOptions("http://27.112.78.165:8070")
+                    //{
+                    //    MaxTimeout = -1,
+                    //};
+
+                    //var client = new RestClient(options);
+                    var client = new RestClient();
+
+                    var request = new RestRequest(baseURL, Method.Post);
+
+                    request.AddHeader("Content-Type", "application/json");
+                    request.AddHeader("Cookie", "session_id=d24ee0e4dab856ec627359b58a1d764f41c18cec");
+
+                    Absensi _absensi = new Absensi();
+                    _absensi.CheckInOut = dataHarian;
+                    var json = JsonSerializer.Serialize(_absensi);
+                    json = json.Replace("CheckInOut", "params");
+
+                    var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                    request.AddStringBody(json, DataFormat.Json);
+                    RestResponse response = client.Execute(request);
+                    string statusCode = response.StatusCode.ToString();
+
+                    logInfo = $"USERID: {userId}, CHECKTIME: {checkTime}, NAME: {userName}, Status: " + statusCode;
+                    PrintNLog(logInfo);
+
+                    if (statusCode == "OK")
+                    {
+                        using (OleDbConnection connHistory = new OleDbConnection(connStringHistory))
+                        {
+                            connHistory.Open();
+                            sql = $"INSERT INTO DATASENT (userid,checktime,checktype,machineid) values ('{userId}','{checkTime}','{checkType}','{machineId}')";
+                            using (OleDbCommand cmdDS = new OleDbCommand(sql, connHistory))
+                            {
+                                cmdDS.ExecuteNonQuery();
+                            }
+
+                            sql = $"SELECT * FROM LASTPROCESSED WHERE MACHINEID = '{machineId}';";
+                            OleDbCommand cmd = new OleDbCommand(sql, connHistory);
+                            OleDbDataReader rdrLP = cmd.ExecuteReader();
+                            if (rdrLP.Read())
+                                sql = $"UPDATE LASTPROCESSED SET userid = '{userId}', checktime = '{checkTime}', checktype = '{checkType}' " +
+                                    $"WHERE machineid = '{machineId}'; ";
+                            else
+                                sql = $"INSERT INTO LASTPROCESSED (userid, checktime, checktype, machineid) values " +
+                                    $"('{userId}', '{checkTime}', '{checkType}', '{machineId}')";
+                            rdrLP.Close();
+
+                            cmd.CommandText = sql;
+                            cmd.ExecuteNonQuery();
+                        }
+
+                        sql = $"UPDATE CHECKINOUT SET SenttoOdoo = 'SUCCESS' WHERE userid = '{userId}' and checktime = '{checkTime}' and " +
+                            $"checktype = '{checkType}'; ";
+                        OleDbCommand cmdSent = new OleDbCommand(sql, connAbsensi);
+                        cmdSent.CommandText = sql;
+                        cmdSent.ExecuteNonQuery();
+                    }
+                    else
+                    {
+                        using (OleDbConnection connHistory = new OleDbConnection(connStringHistory))
+                        {
+                            connHistory.Open();
+                            sql = $"SELECT * FROM LASTPROCESSED WHERE MACHINEID = '{machineId}';";
+                            OleDbCommand cmd = new OleDbCommand(sql, connHistory);
+                            OleDbDataReader rdrLP = cmd.ExecuteReader();
+                            if (rdrLP.Read())
+                                sql = $"UPDATE LASTPROCESSED SET userid = '{userId}', checktime = '{checkTime}', checktype = '{checkType}' " +
+                                    $"WHERE machineid = '{machineId}'; ";
+                            else
+                                sql = $"INSERT INTO LASTPROCESSED (userid, checktime, checktype, machineid) values " +
+                                    $"('{userId}', '{checkTime}', '{checkType}', '{machineId}')";
+                            rdrLP.Close();
+
+                            cmd.CommandText = sql;
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
+
+                    if (Console.KeyAvailable)
+                    {
+                        connAbsensi.Close();
+                        exit = true;
+
+                        logInfo = "Stopped at " + DateTime.Now;
+                        PrintNLog(logInfo);
+                        SaveLogFile();
+
+                        Console.ReadLine();
+                        Environment.Exit(0); ;
+                    }
+                }
+                connAbsensi.Close();
+            }
+            catch (Exception ex)
+            {
+                PrintNLog(ex.Message);
+            }
+        }
+
+        static void PrintNLog(string logMessage)
+        {
+            Console.WriteLine(logMessage);
+            completeLogText = completeLogText + logMessage + Environment.NewLine;
+        }
+
+        static void SaveLogFile()
+        {
+            if (completeLogText.Length == 0) return;
+
+            string logFolder = "logs";
+
+            if (!Directory.Exists(logFolder)) Directory.CreateDirectory(logFolder);
+
+            var waktu = DateTime.Now.ToString("yyyyMMdd-HHmm");
+            string logfile = String.Format($@"{logFolder}\{machineId}-{waktu}.log");
+
+            System.IO.StreamWriter SaveFile = new System.IO.StreamWriter(logfile);
+            SaveFile.WriteLine(completeLogText);
+            SaveFile.Close();
+            completeLogText = "";
+        }
+
+    }
+}
