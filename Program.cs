@@ -3,21 +3,23 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Net.Http;
 using System.Data;
 using System.Data.OleDb;
 using System.Security.Cryptography;
 using System.Text.Json;
-using System.Threading;
 using System.Reflection;
 using RestSharp;
 using System.Diagnostics;
 using static System.Net.Mime.MediaTypeNames;
 using System.Web.UI.WebControls;
 using System.Net.NetworkInformation;
+using System.Web.Security;
+using System.Data.Common;
 
-namespace FingerScan
+namespace ADR_FPWare
 {
     public class PostData
     {
@@ -30,30 +32,131 @@ namespace FingerScan
         public PostData CheckInOut { get; set; }
     }
 
+    public class ResponseData
+    {
+        public string jsonrpc { get; set; }
+        public string id { get; set; }
+        public class results
+        {
+            public string error { get; set; }
+            public string code { get; set; }
+        }
+    }
+
     internal class Program
     {
         static string connStringAbsensi = "";
+        static string dbLocation = "";
+        static string connStringHistory = "";
         static string baseURL = "";
-        static int maxRecords = 0;
-        static int pauseEveryNSecs = 0;
-        static string machineId = "X";
+        static Int32 delayTime = 0;
         static string logInfo = "";
         static string completeLogText = "";
+        static int readLastNDays = 0;
         static volatile bool exit = false;
+        static string tempMDB = "db";
+        static string currentTime = DateTime.Now.ToString("yyyyMMddHHmmss");
+        static string destinationFile = $@"{tempMDB}\temp_{currentTime}.mdb";
+        static string destinationLDB = $@"{tempMDB}\temp_{currentTime}.ldb";
+        static string[] schedules;
 
-        static void Main(string[] args)
+        public static void Main(string[] args)
         {
-            readConfigFile();
-
-            logInfo = "Started at " + DateTime.Now;
+            logInfo = "Application started: " + DateTime.Now;
             PrintNLog(logInfo);
 
-            cekAbsensi();
+            if (!Directory.Exists(tempMDB)) Directory.CreateDirectory(tempMDB);
+            readConfigFile();
+
+            while (!exit)
+            {
+                Skedul();
+
+                if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Q)
+                {
+                    exit = true;
+
+                    logInfo = "User stopped at " + DateTime.Now + "\n\nPress any key to close.";
+                    PrintNLog(logInfo);
+                    SaveLogFile();
+
+                    File.Delete(destinationFile);
+                    Console.ReadLine();
+                    Environment.Exit(0);
+                }
+            }
+
+        }
+
+        private static void Skedul()
+        {
+            OleDbConnection connHistory = new OleDbConnection(connStringHistory);
+            connHistory.Open();
+            string checkDateTime = "";
+            string sql = "SELECT * from LASTPROCESSED";
+            OleDbCommand cmdHistory = new OleDbCommand(sql, connHistory);
+            OleDbDataReader rdrHistory = cmdHistory.ExecuteReader();
+            if (rdrHistory.Read())     // jika sdh ada datanya
+            {
+                checkDateTime = rdrHistory.GetValue(0).ToString();
+            }
+            rdrHistory.Close();
+
+            string nextSchedule = "";
+            foreach (string item in schedules)
+            {
+                string waktu = DateTime.Now.ToString("yyyy-MM-dd") + $" {item}";
+                if (DateTime.Now <= Convert.ToDateTime(waktu))
+                {
+                    nextSchedule = waktu;
+                    break;
+                }
+            }
+            if (nextSchedule == "")
+                nextSchedule = DateTime.Now.AddDays(1).ToString("yyyy-MM-dd") + $" {schedules[0]}";
+
+            while (true)
+            {
+                if (DateTime.Now >= Convert.ToDateTime(nextSchedule))
+                {
+                    Proses();
+                    break;
+                }
+            }
+
+            sql = "SELECT * from LASTPROCESSED";
+            cmdHistory = new OleDbCommand(sql, connHistory);
+            rdrHistory = cmdHistory.ExecuteReader();
+            if (rdrHistory.Read())
+            {
+                sql = $"UPDATE LASTPROCESSED SET [LAST] = '{nextSchedule}'";
+            }
+            else
+            {
+                sql = $"INSERT INTO LASTPROCESSED VALUES ('{nextSchedule}')";
+            }
+            rdrHistory.Close();
+            cmdHistory = new OleDbCommand(sql, connHistory);
+            cmdHistory.ExecuteNonQuery();
+            connHistory.Close();
+        }
+
+        private static void Proses()
+        {
+            logInfo = $"Process started: {DateTime.Now}\n";
+            PrintNLog(logInfo);
+
+            if (cekKoneksiAbsensi())
+                cekAbsensi();
+
+            logInfo = $"Process finished: {DateTime.Now}\n";
+            PrintNLog(logInfo);
+            SaveLogFile();
         }
 
         static void readConfigFile()
         {
-            StreamReader sr = new StreamReader("FingerScan.ini");
+            StreamReader sr = new StreamReader("ADR-FPWare.ini");
             string line = sr.ReadLine();
 
             while (line != null)
@@ -62,34 +165,31 @@ namespace FingerScan
                 if ("#'".Contains(kar) == false)
                 {
                     var split = line.Split('=');
-                    string keyName = split[0].Trim();
+                    string keyName = split[0].Replace(" ", "").ToLower();
                     string value = split[1].Trim();
 
-                    switch (keyName.ToLower())
+                    switch (keyName)
                     {
-                        //case "historydatabase":
-                        //    connStringHistory = @"provider=Microsoft.Jet.OLEDB.4.0; Data Source=" + value;
-                        //    break;
-                        case "databaselocation":
-                            connStringAbsensi = @"provider=Microsoft.Jet.OLEDB.4.0; Data Source=" + value;
+                        case "scheduledtimes":
+                            schedules = value.ToString().Replace(" ", "").Split(',');
                             break;
-                        //case "machineid":
-                        //    machineId = value.ToString();
-                        //    break;
+                        case "databaselocation":
+                            dbLocation = value;
+                            break;
+                        case "historydatabaselocation":
+                            connStringHistory = @"provider=Microsoft.Jet.OLEDB.4.0; Data Source=" + value;
+                            break;
                         case "odoourl":
                             baseURL = value.ToString().Replace(@"\", "/");
                             break;
-                        //case "maxrecords":
-                        //    maxRecords = Convert.ToInt16(value);
-                        //    break;
-                        //case "pauseevery":
-                        //    pauseEveryNSecs = Convert.ToInt16(value);
-                        //    break;
+                        case "delayeachrecordevery(inmiliseconds)":
+                            delayTime = Convert.ToInt32(value);
+                            break;
+                        case "readlastndays":
+                            readLastNDays = Convert.ToInt16(value);
+                            break;
                         default: break;
                     }
-
-                    //logInfo = keyName + ": '" + value + "'";
-                    //PrintNLog(logInfo);
                 }
 
                 line = sr.ReadLine();   //read the next line
@@ -106,27 +206,60 @@ namespace FingerScan
                 url = url.Substring(0, url.IndexOf(":")).Replace("//", "").Replace(@"\\", "");
                 Ping myPing = new Ping();
 
-                for (int i = 0; i <= 50; i++)
+                for (int i = 0; i <= 60; i++)
                 {
                     PingReply reply = myPing.Send(url, 1000);
                     if (reply != null && reply.Status.ToString() == "Success")
                     {
-                        info = "Connected to Odoo Server.";
-                        PrintNLog(info);
                         return true;
                     }
-                    info = "Status: " + reply.Status + ", Time: " + reply.RoundtripTime.ToString() + ", Address: " + reply.Address + "\n";
+                    info = "Status: " + reply.Status + ", Time: " + reply.RoundtripTime.ToString() + ", Address: " + url + "\n";
                     PrintNLog(info);
                 }
                 return false;   //jika tdk ada reply atau reply selain 'Success'
             }
             catch
             {
-                info = "ERROR: Not connected to Odoo Server.";
+                info = "ERROR: Can't connect to Odoo API.";
                 PrintNLog(info);
                 return false;
             }
+        }
 
+        static bool cekKoneksiAbsensi()
+        {
+            string sourceFile = dbLocation;
+
+            try
+            {
+                if (!File.Exists(sourceFile))
+                {
+                    PrintNLog($"File {sourceFile} not exists.");
+                    return false;
+                }
+
+                if (File.Exists(destinationLDB)) File.Delete(destinationLDB);
+                if (File.Exists(destinationFile)) File.Delete(destinationFile);
+
+                File.Copy(sourceFile, destinationFile);
+
+                connStringAbsensi = $"provider=Microsoft.Jet.OLEDB.4.0; Data Source={destinationFile}";
+                OleDbConnection connAbsensi = new OleDbConnection(connStringAbsensi);
+
+                connAbsensi.Open();
+                connAbsensi.Close();
+                return true;
+            }
+            catch (IOException iox)
+            {
+                PrintNLog(iox.Message);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                PrintNLog(ex.Message + ".");
+                return false;
+            }
         }
 
         static void cekAbsensi()
@@ -142,19 +275,34 @@ namespace FingerScan
                 }
                 catch (Exception ex)
                 {
-                    PrintNLog(ex.Message + "\n\nPress any key to close.");
-                    Console.ReadLine();
-                    Environment.Exit(0);
+                    PrintNLog(ex.Message + ".\n");
                 }
 
-                if (maxRecords == 0)
-                    sql = "SELECT ";
-                else
-                    sql = $"SELECT TOP {maxRecords} ";
+                OleDbConnection connHistory = new OleDbConnection(connStringHistory);
+                try
+                {
+                    if (connHistory.State == ConnectionState.Closed) connHistory.Open();
+                }
+                catch (Exception ex)
+                {
+                    PrintNLog(ex.Message + "\n.");
+                }
 
-                sql = sql + " chk.userid, format(chk.checktime,'yyyy-mm-dd HH:mm:ss') as checktime, chk.checktype, u.name, u.badgenumber from checkinout " +
-                    " chk inner join userinfo u on chk.userid = u.userid WHERE chk.senttoodoo is null or chk.senttoodoo = '' or chk.senttoodoo = 'ERROR' " +
-                    " order by chk.checktime;";
+                sql = "SELECT chk.userid, format(chk.checktime,'yyyy-mm-dd HH:mm:ss') as checktime, chk.checktype, u.name, u.badgenumber from" +
+                    " checkinout chk inner join userinfo u on chk.userid = u.userid";
+
+                bool forTheFirstTime = false;   // set to true if this is the first time running
+
+                if (forTheFirstTime)
+                    sql = sql + $" WHERE format(chk.checktime,'yyyy-mm-dd') >= '2024-01-01' ";
+                else
+                {
+                    if (readLastNDays > 0)  // for production: readLastNDays = 5
+                    {
+                        sql = sql + $" WHERE checktime >= dateadd('d', -{readLastNDays}, now())";
+                    }
+                }
+                sql = sql + " ORDER BY chk.checktime;";
 
                 OleDbCommand cmdCheckIn = new OleDbCommand(sql, connAbsensi);
                 OleDbDataReader rdr = cmdCheckIn.ExecuteReader();
@@ -165,6 +313,17 @@ namespace FingerScan
                     string checkType = rdr.GetString(2);
                     string userName = rdr.GetString(3);
                     string badgeNumber = rdr.GetString(4);
+
+                    sql = $"SELECT userid from DATASENT WHERE userid = {userId} AND format(checktime,'yyyy-mm-dd HH:mm:ss') = '{checkTime}'" +
+                        $" AND checkType = '{checkType}' AND sentstatus = 'SUCCESS' ";
+                    OleDbCommand cmdHistory = new OleDbCommand(sql, connHistory);
+                    OleDbDataReader rdrHistory = cmdHistory.ExecuteReader();
+                    if (rdrHistory.Read())     // jika sdh ada datanya
+                    {
+                        rdrHistory.Close();
+                        continue;
+                    }
+                    rdrHistory.Close();
 
                     var dataHarian = new PostData
                     {
@@ -189,55 +348,76 @@ namespace FingerScan
 
                     if (cekKoneksiOdoo() == false)
                     {
-                        logInfo = "Can't connect to Odoo API. Please check the Odoo URL.";
-                        PrintNLog(logInfo);
-                        Console.ReadLine();
+                        //logInfo = "Press any key to try again...\n";
+                        //PrintNLog(logInfo);
+                        //Console.ReadLine();
                     }
 
                     RestResponse response = client.Execute(request);
-                    string statusCode = response.StatusCode.ToString();
+                    //var json2 = JsonSerializer.Deserialize<ResponseData>(response.Content);  // tdk digunakan
 
-                    if (statusCode == "OK")
+                    bool isTesting = false;
+                    int errorPos = -1; // success by default 
+
+                    if (!isTesting)
                     {
-                        sql = $"UPDATE CHECKINOUT SET SenttoOdoo = 'SUCCESS' WHERE " +
-                            $"userid = {userId} and format(checktime,'yyyy-mm-dd HH:mm:ss') = '{checkTime}' and checktype = '{checkType}'; ";
-                        OleDbCommand cmdSent = new OleDbCommand(sql, connAbsensi);
+                        string responseText = response.Content;
+                        errorPos = responseText.IndexOf("error");
+                    }
+
+                    string sentStatus = "";
+                    if (errorPos < 0)
+                    {
+                        sentStatus = "SUCCESS";
+                        sql = $"SELECT userid from DATASENT WHERE userid = {userId} AND format(checktime,'yyyy-mm-dd HH:mm:ss') = '{checkTime}'" +
+                            $" AND checkType = '{checkType}' ";
+                        cmdHistory = new OleDbCommand(sql, connHistory);
+                        rdrHistory = cmdHistory.ExecuteReader();
+                        if (rdrHistory.Read())     // jika sdh ada datanya
+                        {
+                            sql = $"UPDATE DATASENT SET SENTSTATUS = '{sentStatus}', SENTDATE = NOW() WHERE " +
+                                $"userid = {userId} and format(checktime,'yyyy-mm-dd HH:mm:ss') = '{checkTime}' and checktype = '{checkType}'; ";
+                        }
+                        else
+                        {
+                            sql = $"INSERT INTO DATASENT (USERID,CHECKTIME,CHECKTYPE,SENTSTATUS) VALUES ('{userId}','{checkTime}','{checkType}','{sentStatus}')";
+                        }
+                        rdrHistory.Close();
+
+                        OleDbCommand cmdSent = new OleDbCommand(sql, connHistory);
                         cmdSent.CommandText = sql;
                         cmdSent.ExecuteNonQuery();
                     }
                     else
                     {
-                        sql = $"UPDATE CHECKINOUT SET SenttoOdoo = 'ERROR' WHERE " +
-                            $"userid = {userId} and format(checktime,'yyyy-mm-dd HH:mm:ss') = '{checkTime}' and checktype = '{checkType}'; ";
-                        OleDbCommand cmdSent = new OleDbCommand(sql, connAbsensi);
-                        cmdSent.CommandText = sql;
-                        cmdSent.ExecuteNonQuery();
+                        sentStatus = "ERROR employee not found.";
                     }
 
-                    logInfo = $"USERID: {userId}, CHECKTIME: {checkTime}, NAME: {userName}, BADGENUMBER: {badgeNumber}, Sent Status: " + statusCode;
+                    logInfo = $"USERID: {userId}, CHECKTIME: {checkTime}, NAME: {userName}, BADGENUMBER: {badgeNumber}, Sent Status: {sentStatus}";
                     PrintNLog(logInfo);
 
-                    if (Console.KeyAvailable)
+                    if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Q)
                     {
                         connAbsensi.Close();
+                        connHistory.Close();
                         exit = true;
-                        
-                        logInfo = "User stopped at " + DateTime.Now;
+
+                        logInfo = "User stopped at " + DateTime.Now + "\n\nPress any key to close.";
                         PrintNLog(logInfo);
                         SaveLogFile();
 
+                        connAbsensi.Close();
+                        connHistory.Close();
+                        File.Delete(destinationFile);
                         Console.ReadLine();
                         Environment.Exit(0);
                     }
 
-                    Thread.Sleep(400);
+                    Thread.Sleep(delayTime);
                 }
                 connAbsensi.Close();
-
-                logInfo = "Finished at " + DateTime.Now;
-                PrintNLog(logInfo);
-                SaveLogFile();
-                Console.ReadLine();
+                connHistory.Close();
+                File.Delete(destinationFile);
             }
             catch (Exception ex)
             {
@@ -260,7 +440,7 @@ namespace FingerScan
             if (!Directory.Exists(logFolder)) Directory.CreateDirectory(logFolder);
 
             var waktu = DateTime.Now.ToString("yyyyMMdd-HHmm");
-            string logfile = String.Format($@"{logFolder}\Fingerprint-{waktu}.log");
+            string logfile = String.Format($@"{logFolder}\ADR-{waktu}.log");
 
             System.IO.StreamWriter SaveFile = new System.IO.StreamWriter(logfile);
             SaveFile.WriteLine(completeLogText);
